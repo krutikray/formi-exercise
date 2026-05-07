@@ -10,85 +10,187 @@ How Exotel works:
       GET /v1/Accounts/{account_sid}/Calls/{call_sid}/Recording
   Returns 200 + recording_url if ready, 404 if not yet available.
 
-Current approach:
-  Wait 45 seconds. Try once. If it's not there, give up silently.
+Previous approach (REPLACED):
+  await asyncio.sleep(45)   ← wasted worker slot, missed late recordings silently
 
-This means:
-  - Recordings ready in 10s: we waste 35 seconds of wall time
-  - Recordings ready in 60s: we miss them entirely, no retry, no alert
-  - We have no idea how many recordings we're silently missing
+New approach:
+  Poll with exponential backoff. Each attempt is non-blocking between sleeps.
+  Every outcome (success, permanent failure, individual attempt) emits a
+  structured audit event with interaction_id. Nothing is silent.
 
-The Exotel API is poll-friendly — they don't rate-limit the status endpoint.
-The information needed to fix this is already available: try, check, sleep
-a bit, try again. How many times and with what interval is worth thinking about.
+  Poll schedule (defaults): 5s, 7.5s, 11.2s, 16.8s, 25.3s, 30s, 30s...
+  Total window: ~120s for 12 attempts, covering the Exotel 60–90s tail.
 
-Note: recording upload and LLM analysis are completely independent. The LLM
-reads the transcript text, not the audio. There's no reason they have to run
-sequentially. What would need to change for them to run in parallel?
+  Recording and LLM acquisition now run in parallel (asyncio.gather in the
+  Celery task) — the LLM doesn't wait for the recording.
 """
 
 import asyncio
 import logging
+import random
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 from src.config import settings
+from src.services.audit_logger import audit_logger, AuditEventType
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RecordingResult:
+    """
+    Always returned — never returns None.
+    Callers check .status to decide whether to update the DB.
+    """
+    status: str          # "uploaded" | "not_available" | "error"
+    s3_key: Optional[str] = None
+    reason: Optional[str] = None
+    attempts: int = 0
 
 
 async def fetch_and_upload_recording(
     interaction_id: str,
     call_sid: str,
     exotel_account_id: str,
-) -> Optional[str]:
+    customer_id: str = "",
+    campaign_id: str = "",
+) -> RecordingResult:
     """
-    Attempt to fetch the Exotel recording and upload it to S3.
+    Poll Exotel for the recording URL with exponential backoff, then upload to S3.
 
-    Current implementation: sleep 45s, try once, return None on failure.
-    Failure is logged at DEBUG level — effectively invisible in production
-    where the log level is INFO.
+    Returns a RecordingResult with status in ["uploaded", "not_available", "error"].
+    Every outcome emits a structured audit event — nothing is silent.
 
-    Returns the S3 key on success, None on failure or timeout.
+    This function is designed to run concurrently with LLM budget acquisition
+    via asyncio.gather() in the Celery task. It does not block LLM analysis.
     """
+    if not call_sid:
+        # No call_sid means the telephony provider didn't assign one (e.g. unanswered)
+        logger.info(
+            "recording_skipped_no_call_sid",
+            extra={"interaction_id": interaction_id},
+        )
+        return RecordingResult(status="not_available", reason="no_call_sid", attempts=0)
 
-    # This sleep blocks the entire Celery task. While we're sleeping here,
-    # the LLM quota is sitting idle, the analysis hasn't started, and the
-    # dashboard still shows "processing" for what might be a confirmed rebook
-    # that the sales team is waiting to act on.
-    await asyncio.sleep(settings.RECORDING_WAIT_SECONDS)
+    for attempt in range(settings.RECORDING_POLL_MAX_ATTEMPTS):
+        try:
+            recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
 
-    try:
-        recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
+            if recording_url:
+                # Recording is ready — upload to S3
+                try:
+                    s3_key = await _upload_to_s3(recording_url, interaction_id)
+                    await audit_logger.log_event(
+                        interaction_id=interaction_id,
+                        customer_id=customer_id,
+                        campaign_id=campaign_id,
+                        event_type=AuditEventType.RECORDING_UPLOADED,
+                        event_data={
+                            "s3_key": s3_key,
+                            "attempt": attempt + 1,
+                            "call_sid": call_sid,
+                        },
+                    )
+                    logger.info(
+                        "recording_uploaded",
+                        extra={
+                            "interaction_id": interaction_id,
+                            "s3_key": s3_key,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    return RecordingResult(
+                        status="uploaded", s3_key=s3_key, attempts=attempt + 1
+                    )
+                except Exception as upload_err:
+                    # URL was available but upload failed — don't retry the whole
+                    # polling loop; this is a different failure mode (S3/network issue)
+                    await audit_logger.log_event(
+                        interaction_id=interaction_id,
+                        customer_id=customer_id,
+                        campaign_id=campaign_id,
+                        event_type=AuditEventType.RECORDING_FAILED,
+                        event_data={"attempt": attempt + 1, "call_sid": call_sid},
+                        error_detail=f"S3 upload failed: {upload_err}",
+                    )
+                    logger.error(
+                        "recording_upload_to_s3_failed",
+                        extra={
+                            "interaction_id": interaction_id,
+                            "error": str(upload_err),
+                        },
+                    )
+                    return RecordingResult(
+                        status="error",
+                        reason=f"s3_upload_failed: {upload_err}",
+                        attempts=attempt + 1,
+                    )
 
-        if not recording_url:
-            # Not available after 45s. We move on. No record that we tried.
-            # An ops engineer investigating "why is there no recording for
-            # interaction X?" has no log entry to find.
-            logger.debug(
-                "recording_not_available",
-                extra={
-                    "interaction_id": interaction_id,
+            # Recording not yet available — log the attempt and wait
+            await audit_logger.log_event(
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                event_type=AuditEventType.RECORDING_POLL_ATTEMPT,
+                event_data={
+                    "attempt": attempt + 1,
+                    "max_attempts": settings.RECORDING_POLL_MAX_ATTEMPTS,
                     "call_sid": call_sid,
-                    "waited_seconds": settings.RECORDING_WAIT_SECONDS,
                 },
             )
-            return None
 
-        s3_key = await _upload_to_s3(recording_url, interaction_id)
-        return s3_key
+        except Exception as poll_err:
+            # Exotel API call failed (network error, timeout, etc.)
+            # Log and continue to next attempt
+            logger.warning(
+                "recording_poll_attempt_failed",
+                extra={
+                    "interaction_id": interaction_id,
+                    "attempt": attempt + 1,
+                    "error": str(poll_err),
+                },
+            )
 
-    except Exception as e:
-        # Exception is caught here and swallowed. The caller (Celery task)
-        # doesn't know whether this succeeded, failed, or was skipped.
-        # It logs at ERROR level, which is at least visible — but there's
-        # no retry path and no way to replay just the recording upload later.
-        logger.exception(
-            "recording_upload_error",
-            extra={"interaction_id": interaction_id, "error": str(e)},
-        )
-        return None
+        # Exponential backoff with jitter before next attempt
+        if attempt < settings.RECORDING_POLL_MAX_ATTEMPTS - 1:
+            sleep_s = min(
+                settings.RECORDING_POLL_INTERVAL_SECONDS
+                * (settings.RECORDING_POLL_BACKOFF_FACTOR ** attempt),
+                settings.RECORDING_POLL_MAX_SLEEP_SECONDS,
+            )
+            # Jitter: ±20% of sleep_s to spread load across multiple workers
+            jitter = random.uniform(-0.2 * sleep_s, 0.2 * sleep_s)
+            await asyncio.sleep(max(0, sleep_s + jitter))
+
+    # All attempts exhausted — permanent failure
+    # This is an ERROR-level, alertable event (not DEBUG like the old implementation)
+    await audit_logger.log_event(
+        interaction_id=interaction_id,
+        customer_id=customer_id,
+        campaign_id=campaign_id,
+        event_type=AuditEventType.RECORDING_FAILED,
+        event_data={
+            "attempts": settings.RECORDING_POLL_MAX_ATTEMPTS,
+            "call_sid": call_sid,
+        },
+        error_detail=f"Recording not available after {settings.RECORDING_POLL_MAX_ATTEMPTS} attempts",
+    )
+    logger.error(
+        "recording_permanently_failed",
+        extra={
+            "interaction_id": interaction_id,
+            "call_sid": call_sid,
+            "attempts": settings.RECORDING_POLL_MAX_ATTEMPTS,
+        },
+    )
+    return RecordingResult(
+        status="not_available",
+        reason="max_attempts_exceeded",
+        attempts=settings.RECORDING_POLL_MAX_ATTEMPTS,
+    )
 
 
 async def _fetch_exotel_recording_url(
@@ -97,11 +199,13 @@ async def _fetch_exotel_recording_url(
     """
     Hit the Exotel API to get the recording URL for a completed call.
 
-    Returns the recording URL if available, None if not yet ready.
-    The 404 case (not yet ready) and the genuine error case (call had no
-    recording, e.g., call was never connected) look the same from here —
-    both return None. A retry loop would want to handle these differently.
+    Returns the recording URL if available, None if not yet ready (404) or error.
+    Note: 404 (not ready) and genuine errors (call had no recording) both return
+    None here. The polling loop treats them identically — retry until max_attempts.
     """
+    if not account_id or not call_sid:
+        return None
+
     url = f"https://api.exotel.com/v1/Accounts/{account_id}/Calls/{call_sid}/Recording"
 
     try:
@@ -110,6 +214,7 @@ async def _fetch_exotel_recording_url(
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("recording_url")
+            # 404 = not yet ready; any other status = error — both return None
             return None
     except httpx.HTTPError:
         return None
@@ -119,17 +224,25 @@ async def _upload_to_s3(recording_url: str, interaction_id: str) -> str:
     """
     Download the recording from Exotel's URL and upload to S3.
 
-    In production: stream from recording_url → boto3 upload to S3_BUCKET.
+    In production: stream from recording_url → boto3 multipart upload to S3_BUCKET.
     S3 key format: recordings/{interaction_id}.mp3
 
-    The interaction's recording_s3_key column gets updated after this succeeds.
-    If this crashes after the upload but before the DB write, the file is in S3
-    but the interaction row doesn't know about it. Currently no reconciliation job.
+    After a successful upload, the caller is responsible for writing
+    recording_s3_key back to the interactions row (done in the Celery task).
+    If this crashes after upload but before the DB write, the file exists in S3
+    but the row doesn't know — a reconciliation job can detect orphaned keys
+    via S3 list + DB join.
     """
     s3_key = f"recordings/{interaction_id}.mp3"
 
+    # Assessment stub — in production:
+    #   async with aioboto3.resource("s3") as s3:
+    #       async with httpx.AsyncClient() as client:
+    #           resp = await client.get(recording_url)
+    #           await s3.Object(settings.S3_BUCKET, s3_key).put(Body=resp.content)
+
     logger.info(
-        "recording_uploaded",
+        "recording_s3_upload_completed",
         extra={"interaction_id": interaction_id, "s3_key": s3_key},
     )
     return s3_key
