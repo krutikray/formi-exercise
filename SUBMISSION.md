@@ -1,6 +1,6 @@
 # Post-Call Processing Pipeline — Design Document
 
-**Author:** [Your Name]
+**Author:** Krutik Raythatha
 **Date:** 2026-05-08
 
 ---
